@@ -1,0 +1,38 @@
+{
+  "entities": {
+    "Conversation": {
+      "title": "Conversation",
+      "description": "A recorded conversation session between the user and Tania.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The unique ID of the user who owns this conversation."
+        },
+        "topic": {
+          "type": "string",
+          "description": "A short summary or topic of the conversation."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The timestamp when the conversation was created."
+        },
+        "transcript": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The list of messages in the conversation."
+        }
+      },
+      "required": ["userId", "createdAt", "transcript"]
+    }
+  },
+  "firestore": {
+    "/conversations/{conversationId}": {
+      "schema": "Conversation",
+      "description": "Collection of saved conversations."
+    }
+  }
+}

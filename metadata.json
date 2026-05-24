@@ -1,0 +1,6 @@
+{
+  "name": "Ayubowan Avatar",
+  "description": "A voice-enabled Sri Lankan woman avatar powered by Gemini Live API with real-time lip synchronization and internet search capabilities.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

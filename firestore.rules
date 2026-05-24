@@ -1,0 +1,46 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: conversations
+    // Document ID: auto-generated
+    // Fields:
+    //   - userId: string (required) - The UID of the owner
+    //   - createdAt: timestamp (required) - Creation time
+    //   - transcript: list (required) - Array of strings
+    //
+    // ===============================================================
+
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidConversation(data) {
+      return data.keys().hasAll(['userId', 'createdAt', 'transcript']) &&
+             data.userId is string &&
+             data.createdAt is timestamp &&
+             data.transcript is list &&
+             data.transcript.size() <= 1000;
+    }
+
+    match /conversations/{conversationId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create: if isAuthenticated() && 
+                      request.resource.data.userId == request.auth.uid &&
+                      isValidConversation(request.resource.data);
+      allow update: if isAuthenticated() && 
+                      resource.data.userId == request.auth.uid &&
+                      request.resource.data.userId == resource.data.userId &&
+                      isValidConversation(request.resource.data);
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+  }
+}
