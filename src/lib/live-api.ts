@@ -1,15 +1,19 @@
-import { GoogleGenAI, Modality } from "@google/genai";
+export enum Modality {
+  MODALITY_UNSPECIFIED = "MODALITY_UNSPECIFIED",
+  TEXT = "TEXT",
+  IMAGE = "IMAGE",
+  AUDIO = "AUDIO",
+}
 
 export interface LiveAPIConfig {
-  apiKey: string;
+  apiKey?: string; // Optional: API Key is held securely server-side
   model: string;
   systemInstruction?: string;
   tools?: any[];
 }
 
 export class LiveAPI {
-  private ai: any;
-  private session: any;
+  private ws: WebSocket | null = null;
   private audioContext: AudioContext | null = null;
   private stream: MediaStream | null = null;
   private processor: ScriptProcessorNode | null = null;
@@ -23,38 +27,28 @@ export class LiveAPI {
   private isUserSpeaking = false;
   private nextStreamTime = 0;
   private playingSources: AudioBufferSourceNode[] = [];
-
-  constructor(private config: LiveAPIConfig) {
-    if (!config.apiKey) {
-      throw new Error("An API Key must be set for LiveAPI to function.");
-    }
-    // Initialize SDK
-    this.ai = new GoogleGenAI({ 
-      apiKey: config.apiKey, 
-      apiVersion: "v1beta",
-      vertexai: false
-    });
-    
-    // The SDK sometimes defaults to "v1main" internally for WebSockets.
-    // We need to force it to use "v1beta" by patching the apiClient.
-    if (this.ai.apiClient) {
-      this.ai.apiClient.getApiVersion = () => "v1beta";
-      
-      // If there's an internal clientOptions, force it there too
-      if (this.ai.apiClient.clientOptions) {
-        this.ai.apiClient.clientOptions.apiVersion = "v1beta";
-      }
-    }
-
-    console.log("Initialized GoogleGenAI forced to v1beta");
-    if (this.ai.apiClient) {
-      console.log("SDK ApiClient resolved apiVersion:", this.ai.apiClient.getApiVersion());
-      console.log("SDK ApiClient resolved websocketBaseUrl:", this.ai.apiClient.getWebsocketBaseUrl());
-    }
-  }
-
   private analyser: AnalyserNode | null = null;
   private volumeInterval: any = null;
+  private pingInterval: any = null;
+  private isDisposed = false;
+  public outputDeviceId = "default";
+
+  constructor(private config: LiveAPIConfig) {
+    console.log("Initialized LiveAPI Browser Proxy Interface Client");
+    if (!(window as any).__allLiveApis) {
+      (window as any).__allLiveApis = [];
+    }
+    (window as any).__allLiveApis.push(this);
+  }
+
+  setAudioOutputDevice(deviceId: string) {
+    this.outputDeviceId = deviceId || "default";
+    if (this.audioContext && typeof (this.audioContext as any).setSinkId === 'function') {
+      (this.audioContext as any).setSinkId(this.outputDeviceId)
+        .then(() => console.log(`[LiveAPI] Routed context speakers successfully to: ${this.outputDeviceId}`))
+        .catch((err: any) => console.error("[LiveAPI] Failed to route context speakers to sinkId:", err));
+    }
+  }
 
   async connect(callbacks: {
     onVolumeChange?: (volume: number) => void;
@@ -66,14 +60,23 @@ export class LiveAPI {
     onToolCall?: (toolCall: any) => Promise<any>;
   }) {
     if (this.isConnected) return;
+    this.isDisposed = false;
 
-    // Pre-initialize and resume AudioContext in user-gesture thread for Android/iOS compatibility
+    // Pre-initialize and resume AudioContext in user-gesture-safe thread for Android/iOS compatibility
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       if (AudioCtx) {
-        this.audioContext = new AudioCtx({ sampleRate: 16000 });
+        this.audioContext = new AudioCtx();
+        if (this.outputDeviceId && this.outputDeviceId !== "default" && typeof (this.audioContext as any).setSinkId === 'function') {
+          (this.audioContext as any).setSinkId(this.outputDeviceId).catch((e: any) => console.error("[Audio] Connect setSinkId failed:", e));
+        }
         if (this.audioContext.state === 'suspended') {
           await this.audioContext.resume();
+        }
+        if (this.isDisposed) {
+          console.log("[Audio] Connection aborted during AudioContext resumption.");
+          this.disconnect();
+          return;
         }
         console.log("AudioContext pre-initialized successfully in user-gesture-safe scope.");
       }
@@ -89,51 +92,90 @@ export class LiveAPI {
     const onError = callbacks.onError || ((err) => console.error("Live API Error:", err));
     this.onToolCall = callbacks.onToolCall || this.onToolCall;
 
+    if (this.isDisposed) {
+      console.log("[Connect] Connection aborted before WebSocket handshake.");
+      return;
+    }
+
     try {
-      console.log("Connecting to Live API with model:", this.config.model);
-      const modelName = this.config.model.startsWith("models/") ? this.config.model : `models/${this.config.model}`;
-      
-      this.onTranscript("System: Negotiating connection with voice engine...");
-      
-      this.session = await this.ai.live.connect({
-        model: modelName,
-        config: {
-          systemInstruction: { parts: [{ text: this.config.systemInstruction || "" }] },
-          tools: this.config.tools || [{ googleSearch: {} }],
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
-          },
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-        },
-        callbacks: {
-          onopen: async () => {
-            console.log("Live API Session Opened");
+      console.log("Connecting client to server WebSocket proxy...");
+      this.onTranscript("System: Negotiating connection with voice engine backend...");
+
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${protocol}//${window.location.host}/api/live`;
+      this.ws = new WebSocket(wsUrl);
+
+      this.ws.onopen = () => {
+        if (this.isDisposed) {
+          console.log("[Connect] WS opened but LiveAPI matches isDisposed. Hard collapsing.");
+          try { this.ws?.close(); } catch (e) {}
+          this.ws = null;
+          return;
+        }
+        console.log("WebSocket connection to server proxy opened");
+        // Handshake: initiate backend connection to Gemini Live API
+        this.ws?.send(JSON.stringify({
+          type: "connect",
+          model: this.config.model,
+          config: {
+            systemInstruction: this.config.systemInstruction || "",
+            tools: this.config.tools || [],
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
+            },
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+          }
+        }));
+
+        // Keep connection alive with proxy/servers against 30-second idle rules
+        this.pingInterval = setInterval(() => {
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: "ping" }));
+          }
+        }, 15000); // Send heartbeat every 15 seconds
+      };
+
+      this.ws.onmessage = async (event) => {
+        if (this.isDisposed) return;
+        try {
+          const message = JSON.parse(event.data);
+          
+          if (message.type === "open") {
+            console.log("Live API voice gateway opened fully.");
             this.isConnected = true;
             await this.setupAudioSystem();
             onOpen();
-          },
-          onmessage: async (message: any) => {
-            console.log("Live API Message Received:", JSON.stringify(message).slice(0, 200) + "...");
-            await this.handleMessage(message);
-          },
-          onclose: () => {
-            console.log("Live API Session Closed");
+          } else if (message.type === "close") {
+            console.log("Server indicated voice connection closed");
             this.disconnect();
             onClose();
-          },
-          onerror: (error: any) => {
-            console.error("Live API Session Error:", error);
-            this.isConnected = false;
-            let msg = "Network error - please check your API key";
-            if (error?.message) msg = error.message;
-            onError(new Error(msg));
+          } else if (message.type === "error") {
+            console.error("Server-side setup error:", message.error);
+            onError(new Error(message.error));
             this.disconnect();
-            onClose();
-          },
-        },
-      });
+          } else if (message.type === "message") {
+            // Forward real-time content payload to parser
+            await this.handleMessage(message.data);
+          }
+        } catch (parseErr) {
+          console.error("Error parsing websocket packet from server:", parseErr);
+        }
+      };
+
+      this.ws.onclose = () => {
+        console.log("Proxy WebSocket closed");
+        this.disconnect();
+        onClose();
+      };
+
+      this.ws.onerror = (error) => {
+        console.error("Proxy WebSocket error:", error);
+        onError(new Error("Network error - failed to reach server gateway."));
+        this.disconnect();
+        onClose();
+      };
 
     } catch (error) {
       console.error("Connect failure:", error);
@@ -162,7 +204,7 @@ export class LiveAPI {
         }
       }
 
-      // 2. Handle Audio Transcriptions (supporting both modern and legacy fields)
+      // 2. Handle Audio Transcriptions
       const inputTranscription = serverContent.inputTranscription;
       if (inputTranscription?.text?.trim()) {
         console.log("Input Speech Transcription:", inputTranscription.text.trim());
@@ -181,11 +223,9 @@ export class LiveAPI {
         // Map roles correctly
         let role = audioTranscription.role;
         if (!role) {
-          // Fallback logic if role is missing
           role = (this.isPlaying || this.audioQueue.length > 0) ? "model" : "user";
         }
 
-        // Standardize roles to Tania/Pesala prefixes
         const prefix = (role === "user" || role === "USER") ? "Pesala: " : "Tania: ";
         this.onTranscript(`${prefix}${audioTranscription.text.trim()}`);
       }
@@ -208,7 +248,7 @@ export class LiveAPI {
       }
     }
 
-    // 4. Handle Tool Calls (At root or inside serverContent)
+    // 4. Handle Tool Calls
     const toolCall = message.toolCall || serverContent?.toolCall;
     if (toolCall) {
       console.log("Tool Call detected:", toolCall);
@@ -232,14 +272,21 @@ export class LiveAPI {
           });
         }
       }
-      if (functionResponses.length > 0) {
+      if (functionResponses.length > 0 && this.ws && this.isConnected) {
         console.log("Sending Tool Responses:", functionResponses);
-        this.session.sendToolResponse({ functionResponses });
+        this.ws.send(JSON.stringify({
+          type: "tool_response",
+          data: { functionResponses }
+        }));
       }
     }
   }
 
   private async setupAudioSystem() {
+    if (this.isDisposed) {
+      console.log("[Audio] setupAudioSystem aborted because instance is already disposed.");
+      return;
+    }
     console.log("Setting up audio system...");
     
     // Setup Microphone
@@ -247,9 +294,9 @@ export class LiveAPI {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         console.warn("Browser does not support getUserMedia. Proceeding without microphone.");
       } else {
-        // Debug: List devices to see if any mic exists
         try {
           const devices = await navigator.mediaDevices.enumerateDevices();
+          if (this.isDisposed) return;
           const hasMic = devices.some(d => d.kind === 'audioinput');
           console.log("Available audio input devices:", devices.filter(d => d.kind === 'audioinput'));
           
@@ -260,6 +307,8 @@ export class LiveAPI {
           console.warn("Could not enumerate devices:", e);
         }
 
+        if (this.isDisposed) return;
+
         try {
           this.stream = await navigator.mediaDevices.getUserMedia({ 
             audio: {
@@ -269,30 +318,37 @@ export class LiveAPI {
             } 
           });
         } catch (err: any) {
+          if (this.isDisposed) return;
           console.warn("Microphone with full constraints failed, retrying with basic audio:true...", err);
           this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         }
       }
     } catch (err: any) {
+      if (this.isDisposed) return;
       console.error("Microphone Access Error:", err);
-      // We do not throw here, so the user can still use text input and hear output
       this.onTranscript("System: Microphone not found or access denied. You can still type to chat.");
     }
 
-    // Reuse pre-initialized context or create a new one as fallback
+    if (this.isDisposed || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      if (this.stream) {
+        this.stream.getTracks().forEach(track => track.stop());
+        this.stream = null;
+      }
+      return;
+    }
+
+    // Reuse or create AudioContext
     if (!this.audioContext) {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       if (AudioCtx) {
-        try {
-          this.audioContext = new AudioCtx({ sampleRate: 16000 });
-        } catch (err) {
-          console.warn("Fallback to default sampleRate in manual context creation:", err);
-          this.audioContext = new AudioCtx();
+        // Create with native hardware default sampleRate for superior stability, responsiveness, and to avoid double-resampling glitches
+        this.audioContext = new AudioCtx();
+        if (this.outputDeviceId && this.outputDeviceId !== "default" && typeof (this.audioContext as any).setSinkId === 'function') {
+          (this.audioContext as any).setSinkId(this.outputDeviceId).catch((e: any) => console.error("[Audio] Setup setSinkId failed:", e));
         }
       }
     }
     
-    // Ensure context is running (browsers often suspend it)
     if (this.audioContext && this.audioContext.state === 'suspended') {
       try {
         await this.audioContext.resume();
@@ -301,30 +357,43 @@ export class LiveAPI {
       }
     }
 
-    // Setup Analyser for output lip-sync (hearing Tania)
-    this.analyser = this.audioContext.createAnalyser();
+    if (this.isDisposed || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      console.log("[Audio] Aborting audio context setup because WS is inactive or instance is disposed");
+      if (this.stream) {
+        this.stream.getTracks().forEach(track => track.stop());
+        this.stream = null;
+      }
+      if (this.audioContext) {
+        if (this.audioContext.state !== 'closed') {
+          this.audioContext.close().catch(e => console.error("Error closing AudioContext on safe dispose:", e));
+        }
+        this.audioContext = null;
+      }
+      return;
+    }
+
+    // Setup Analyser for lip-sync / volume rendering
+    this.analyser = this.audioContext!.createAnalyser();
     this.analyser.fftSize = 256;
     this.analyser.smoothingTimeConstant = 0.1; 
     this.analyser.minDecibels = -90;
     this.analyser.maxDecibels = -10;
-    this.analyser.connect(this.audioContext.destination);
+    this.analyser.connect(this.audioContext!.destination);
 
-    // Only setup recording processor if we have a stream
+    // Recording processor
     if (this.stream) {
-      const source = this.audioContext.createMediaStreamSource(this.stream);
-      this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
+      const source = this.audioContext!.createMediaStreamSource(this.stream);
+      this.processor = this.audioContext!.createScriptProcessor(4096, 1, 1);
       
       this.processor.onaudioprocess = (e) => {
-        if (!this.isConnected || !this.session) return;
+        if (!this.isConnected || !this.ws) return;
         
         try {
           const inputData = e.inputBuffer.getChannelData(0);
           const currentSampleRate = e.inputBuffer.sampleRate;
           
-          // Downsample high rate mic to 16000 for server-side compatibility
           const downsampledData = this.downsampleBuffer(inputData, currentSampleRate, 16000);
           
-          // Check if there's actual audio signal (not just silence)
           let maxVal = 0;
           for (let i = 0; i < downsampledData.length; i++) {
             const abs = Math.abs(downsampledData[i]);
@@ -335,24 +404,27 @@ export class LiveAPI {
           const pcmData = this.float32ToInt16(downsampledData);
           const base64Data = this.arrayBufferToBase64(pcmData.buffer);
           
-          this.session.sendRealtimeInput({
-            audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
-          });
+          this.ws.send(JSON.stringify({
+            type: "input",
+            data: {
+              audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
+            }
+          }));
         } catch (err) {
           console.error("Error sending audio input:", err);
         }
       };
 
       source.connect(this.processor);
-      this.processor.connect(this.audioContext.destination);
+      this.processor.connect(this.audioContext!.destination);
     }
 
-    // Start volume tracking loop
     this.startVolumeTracking();
   }
 
   private startVolumeTracking() {
-    const dataArray = new Float32Array(this.analyser!.frequencyBinCount);
+    if (!this.analyser) return;
+    const dataArray = new Float32Array(this.analyser.frequencyBinCount);
     const track = () => {
       if (!this.isConnected || !this.analyser) return;
       
@@ -363,7 +435,6 @@ export class LiveAPI {
       }
       const rms = Math.sqrt(sum / dataArray.length);
       
-      // Debug: console.log("RMS Volume:", rms);
       this.onVolumeChange(rms);
       this.volumeInterval = requestAnimationFrame(track);
     };
@@ -371,6 +442,7 @@ export class LiveAPI {
   }
 
   private handleAudioOutput(base64: string) {
+    if (this.isDisposed || !this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const audioData = this.base64ToFloat32(base64);
     
     if (!this.audioContext || !this.analyser) return;
@@ -380,27 +452,56 @@ export class LiveAPI {
 
     const source = this.audioContext.createBufferSource();
     source.buffer = buffer;
-    source.connect(this.analyser);
+
+    // Create a local GainNode per audio chunk to execute sub-millisecond edge fading/crossfading
+    // This removes high-frequency click bursts at slice/packet boundaries
+    const chunkGain = this.audioContext.createGain();
+    
+    // Connect track source -> gain -> primary frequency analyser
+    source.connect(chunkGain);
+    chunkGain.connect(this.analyser);
 
     const currentTime = this.audioContext.currentTime;
-    
-    // Smooth sample-accurate pipeline scheduling optimized for Android/mobile devices
     const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
-    const schedulingOffset = isMobile ? 0.15 : 0.05; // 150ms on mobile covers Android bluetooth/thread latency, 50ms on desktop
+    
+    // Maintain a safe/protective lookahead cushion to smooth over brief network arrival delays and avoid word-to-word choppiness
+    const schedulingOffset = isMobile ? 0.12 : 0.05;
 
+    // Dynamic latency adjustment:
     if (this.nextStreamTime < currentTime) {
+      // Underflow: The queue finished or is empty, start fresh from the lookahead offset
+      this.nextStreamTime = currentTime + schedulingOffset;
+    } else if (this.nextStreamTime > currentTime + 3.0) {
+      // Extreme overflow/drift: Clear all active scheduled sources to prevent overlapping/dual voices
+      console.warn(`[Audio] Overflow/drift threshold exceeded (${(this.nextStreamTime - currentTime).toFixed(2)}s). Resetting audio scheduler.`);
+      this.playingSources.forEach(s => {
+        try {
+          s.stop();
+        } catch (e) {}
+      });
+      this.playingSources = [];
       this.nextStreamTime = currentTime + schedulingOffset;
     }
 
-    source.start(this.nextStreamTime);
+    const duration = buffer.duration;
+    const playTime = this.nextStreamTime;
+
+    // Apply 3ms input-and-output micro-fades to blend discontinuous PCM slices with perfect warmth
+    const fadeDuration = Math.min(0.003, duration / 2.1);
+    
+    chunkGain.gain.setValueAtTime(0, playTime);
+    chunkGain.gain.linearRampToValueAtTime(1, playTime + fadeDuration);
+    chunkGain.gain.setValueAtTime(1, playTime + duration - fadeDuration);
+    chunkGain.gain.linearRampToValueAtTime(0, playTime + duration);
+
+    source.start(playTime);
     
     this.playingSources.push(source);
     source.onended = () => {
       this.playingSources = this.playingSources.filter(s => s !== source);
     };
 
-    // Increment start time by precise buffer duration
-    this.nextStreamTime += buffer.duration;
+    this.nextStreamTime += duration;
   }
 
   private stopPlayback() {
@@ -408,7 +509,7 @@ export class LiveAPI {
       try {
         source.stop();
       } catch (err) {
-        // Handle source states gracefully
+        // State error safe
       }
     });
     this.playingSources = [];
@@ -473,35 +574,32 @@ export class LiveAPI {
     return btoa(binary);
   }
 
-  private analyzeVolume(data: Float32Array) {
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) {
-      sum += data[i] * data[i];
-    }
-    const rms = Math.sqrt(sum / data.length);
-    this.onVolumeChange(rms);
-  }
-
   sendText(text: string) {
-    if (this.session && this.isConnected) {
-      this.session.sendRealtimeInput({ text });
+    if (this.ws && this.isConnected) {
+      this.ws.send(JSON.stringify({ type: "text", text }));
     }
   }
 
   disconnect() {
-    if (!this.isConnected && !this.session && !this.audioContext) return;
+    this.isDisposed = true;
+    if (!this.isConnected && !this.ws && !this.audioContext) return;
+
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
 
     this.isConnected = false;
     this.isPlaying = false;
     this.audioQueue = [];
 
-    if (this.session) {
+    if (this.ws) {
       try {
-        this.session.close();
+        this.ws.close();
       } catch (e) {
-        console.error("Error closing session:", e);
+        console.error("Error closing client WebSocket:", e);
       }
-      this.session = null;
+      this.ws = null;
     }
     if (this.stream) {
       this.stream.getTracks().forEach(track => track.stop());
@@ -525,5 +623,18 @@ export class LiveAPI {
       }
       this.audioContext = null;
     }
+  }
+
+  static disconnectAll() {
+    const apis = (window as any).__allLiveApis || [];
+    console.log(`[Global Cleanup] Disconnecting all ${apis.length} registered LiveAPI instances...`);
+    apis.forEach((api: any) => {
+      try {
+        api.disconnect();
+      } catch (e) {
+        console.warn("Error disconnecting registered LiveAPI instance:", e);
+      }
+    });
+    (window as any).__allLiveApis = [];
   }
 }
