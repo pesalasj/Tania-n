@@ -31,6 +31,19 @@ service cloud.firestore {
              data.transcript.size() <= 1000;
     }
 
+    function isValidReminder(data) {
+      return data.keys().hasAll(['userId', 'id', 'condition', 'status', 'createdAt']) &&
+             data.userId is string &&
+             data.id is string &&
+             data.id.size() <= 128 &&
+             data.condition is string &&
+             data.condition.size() <= 1000 &&
+             data.status is string &&
+             (data.status == 'active' || data.status == 'met') &&
+             data.createdAt is string &&
+             data.createdAt.size() <= 64;
+    }
+
     match /conversations/{conversationId} {
       allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
       allow create: if isAuthenticated() && 
@@ -41,6 +54,22 @@ service cloud.firestore {
                       request.resource.data.userId == resource.data.userId &&
                       isValidConversation(request.resource.data);
       allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+
+    match /reminders/{reminderId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create: if isAuthenticated() && 
+                      request.resource.data.userId == request.auth.uid &&
+                      isValidReminder(request.resource.data);
+      allow update: if isAuthenticated() && 
+                      resource.data.userId == request.auth.uid &&
+                      request.resource.data.userId == resource.data.userId &&
+                      isValidReminder(request.resource.data);
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+
+    match /test/connection {
+      allow read: if true;
     }
   }
 }

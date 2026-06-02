@@ -6,12 +6,15 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality } from "@google/genai";
 import dotenv from "dotenv";
 import nodemailer from "nodemailer";
+import * as XLSX from "xlsx";
+import mammoth from "mammoth";
 
 dotenv.config();
 
 async function startServer() {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
   const server = http.createServer(app);
   const PORT = 3000;
 
@@ -19,7 +22,11 @@ async function startServer() {
   const wss = new WebSocketServer({ noServer: true });
 
   // Strictly enforce a single, active voice/client WebSocket connection at any time to guarantee no dual voices exist
+  const allActiveWebSockets = new Set<any>();
+  const allActiveGeminiSessions = new Set<any>();
   let activeClientSocket: any = null;
+  let activeGeminiSession: any = null;
+  let activeGeminiSessionAttemptId: string | null = null;
 
   // Handle upgrade manually to hook onto /api/live
   server.on("upgrade", (request, socket, head) => {
@@ -36,6 +43,134 @@ async function startServer() {
   // API health status
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
+  });
+
+  // High-fidelity file and document parsing API
+  app.post("/api/parse-document", async (req, res) => {
+    try {
+      const { fileName, fileType, mimeType, base64 } = req.body;
+      if (!base64) {
+        return res.status(400).json({ success: false, error: "Missing base64 file data" });
+      }
+
+      console.log(`[Parse Document] Parsing file "${fileName}" with type: ${fileType}, mime: ${mimeType}`);
+
+      const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || "";
+      if (!apiKey) {
+        return res.status(500).json({ success: false, error: "GEMINI_API_KEY is not defined in the server secrets." });
+      }
+
+      const ai = new GoogleGenAI({
+        apiKey,
+        apiVersion: "v1beta",
+        vertexai: false,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build'
+          }
+        }
+      });
+
+      const ext = (fileType || "").toLowerCase() || (fileName || "").split('.').pop()?.toLowerCase() || "";
+      let parsedText = "";
+
+      // 1. PDF Documents
+      if (ext === "pdf" || mimeType === "application/pdf") {
+        console.log(`[Parse Document] Sending PDF directly to Gemini for high-fidelity native processing...`);
+        const response = await ai.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: [
+            {
+              inlineData: {
+                data: base64,
+                mimeType: "application/pdf"
+              }
+            },
+            {
+              text: "Please extract all instructions, operational steps, rules, or text from this PDF file. Format the extracted text cleanly so a system can read and understand it as instructions, keeping layout spacing clear and natural. Output ONLY the extracted and clean formatting of the instructions, with no extra conversation or introduction."
+            }
+          ]
+        });
+        parsedText = response.text || "No text could be extracted from this PDF.";
+      }
+      // 2. Images (JPEG, PNG, etc.)
+      else if (ext === "jpeg" || ext === "jpg" || ext === "png" || ext === "webp" || (mimeType && mimeType.startsWith("image/"))) {
+        console.log(`[Parse Document] Sending Image directly to Gemini for premium OCR text extraction...`);
+        const response = await ai.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: [
+            {
+              inlineData: {
+                data: base64,
+                mimeType: mimeType || "image/jpeg"
+              }
+            },
+            {
+              text: "Please perform OCR (Optical Character Recognition) on this image to extract all instructions, text, or steps. Maintain the logical structure of any text, headers, or bullet points. Output ONLY the extracted text, with no extra conversational remarks."
+            }
+          ]
+        });
+        parsedText = response.text || "No text could be extracted from this image.";
+      }
+      // 3. Word Processing (.docx, .doc)
+      else if (ext === "docx" || ext === "doc" || mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+        console.log(`[Parse Document] Extracting Word document contents using Mammoth...`);
+        const buffer = Buffer.from(base64, "base64");
+        const mammothResult = await mammoth.extractRawText({ buffer }).catch(err => {
+          console.error("[Parse Document] Mammoth extraction error:", err);
+          return { value: "" };
+        });
+        
+        const rawText = mammothResult.value;
+        if (!rawText || !rawText.trim()) {
+          return res.status(400).json({ success: false, error: "The Word document appears to be empty or contains unreadable text." });
+        }
+
+        console.log(`[Parse Document] Word document raw characters matched successfully. Beautifying with Gemini...`);
+        const response = await ai.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: `Here is the raw extracted text from a Word document containing instructions. Clean up any weird symbols, restore logical paragraphs and list items, and format it into clean operational instructions. Output ONLY the clean instructions text:\n\n${rawText}`
+        });
+        parsedText = response.text || rawText;
+      }
+      // 4. Excel Spreadsheets (.xlsx, .xls)
+      else if (ext === "xlsx" || ext === "xls" || mimeType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") {
+        console.log(`[Parse Document] Parsing Excel spreadsheet using SheetJS...`);
+        const buffer = Buffer.from(base64, "base64");
+        const workbook = XLSX.read(buffer, { type: "buffer" });
+        let csvContent = "";
+        
+        workbook.SheetNames.forEach(sheetName => {
+          const sheet = workbook.Sheets[sheetName];
+          const csv = XLSX.utils.sheet_to_csv(sheet);
+          if (csv && csv.trim()) {
+            csvContent += `[Sheet: ${sheetName}]\n${csv}\n\n`;
+          }
+        });
+        
+        if (!csvContent || !csvContent.trim()) {
+          return res.status(400).json({ success: false, error: "The Excel document has no sheets or cells with readable content." });
+        }
+
+        console.log(`[Parse Document] Spreadsheet rows parsed. Structuring instructions with Gemini...`);
+        const response = await ai.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: `Here is tabular data (CSV) from an Excel spreadsheet representing instructions. Interpret the rows and columns, structure them as a clean set of operational steps or notes, and clean up any formatting. Output ONLY the beautifully structured steps/rules:\n\n${csvContent}`
+        });
+        parsedText = response.text || csvContent;
+      }
+      // 5. Default/Raw text fallback
+      else {
+        console.log(`[Parse Document] Performing raw text conversion fallback...`);
+        parsedText = Buffer.from(base64, "base64").toString("utf-8");
+      }
+
+      console.log(`[Parse Document] Successfully parsed ${parsedText.length} characters of text content.`);
+      return res.json({ success: true, text: parsedText.trim() });
+    } catch (err: any) {
+      console.error("[Parse Document Error]:", err);
+      return res.status(500).json({ success: false, error: err.message || "Failed to parse document" });
+    }
   });
 
   // In-memory image cache to ensure consistency and prevent difference between preview & download
@@ -528,6 +663,86 @@ async function startServer() {
     }
   });
 
+  // Fetch YouTube Videos Scraping Search Service
+  async function fetchYouTubeVideos(query: string) {
+    try {
+      const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+      console.log(`[YouTube Search] Requesting search for: "${query}" via ${url}`);
+      const response = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+          "Accept-Language": "en-US,en;q=0.9"
+        }
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP error ${response.status}`);
+      }
+      const html = await response.text();
+      
+      const videoIdPattern = /"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/g;
+      const ids: string[] = [];
+      let match;
+      while ((match = videoIdPattern.exec(html)) !== null) {
+        if (match[1]) {
+          ids.push(match[1]);
+        }
+        if (ids.length >= 40) break;
+      }
+      
+      const uniqueIds = Array.from(new Set(ids)).slice(0, 5);
+      const results = uniqueIds.map(id => ({
+        videoId: id,
+        title: `${query} clip (${id})`,
+        thumbnail: `https://img.youtube.com/vi/${id}/mqdefault.jpg`
+      }));
+      
+      const blocks = html.split('{"videoRenderer":');
+      const enrichedResults = [];
+      
+      for (let i = 1; i < blocks.length && enrichedResults.length < 5; i++) {
+        const block = blocks[i];
+        const idMatch = block.match(/"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/);
+        const titleMatch = block.match(/"title"\s*:\s*\{\s*"runs"\s*:\s*\[\s*\{\s*"text"\s*:\s*"([^"]+)"/);
+        
+        if (idMatch && idMatch[1]) {
+          const vidId = idMatch[1];
+          let title = titleMatch && titleMatch[1] ? titleMatch[1] : `${query} video`;
+          title = title.replace(/\\u0026/g, '&')
+                       .replace(/\\"/g, '"')
+                       .replace(/\\'/g, "'");
+          
+          enrichedResults.push({
+            videoId: vidId,
+            title: title,
+            thumbnail: `https://img.youtube.com/vi/${vidId}/mqdefault.jpg`
+          });
+        }
+      }
+      
+      if (enrichedResults.length > 0) {
+        return enrichedResults;
+      }
+      return results;
+    } catch (err: any) {
+      console.error("[YouTube Scraper Error]:", err);
+      return [];
+    }
+  }
+
+  app.get("/api/youtube-search", async (req, res) => {
+    try {
+      const query = req.query.query as string || "";
+      if (!query) {
+        return res.status(400).json({ error: "Missing query parameter" });
+      }
+      const videos = await fetchYouTubeVideos(query);
+      res.json({ success: true, videos });
+    } catch (error: any) {
+      console.error("[YouTube API Error]:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // Send formal custom email using Nodemailer (with failover/mailto fallbacks)
   app.post("/api/send-email", async (req, res) => {
     try {
@@ -648,20 +863,41 @@ async function startServer() {
   wss.on("connection", (clientWs) => {
     console.log("[Proxy] Socket opened: Browser connected to server gateway");
     
-    // HARD CONCURRENCY PREVENTION: Close any existing active connection immediately
-    if (activeClientSocket) {
-      console.log("[Proxy] Forcefully closing duplicate active browser connection to prevent dual voice streams.");
-      try {
-        activeClientSocket.send(JSON.stringify({
-          type: "close",
-          reason: "Newer microphone session initiated on another frame or thread."
-        }));
-        activeClientSocket.close();
-      } catch (e) {
-        console.warn("[Proxy] Handled error closing duplicate socket:", e);
+    // HARD CONCURRENCY PREVENTION: Close and terminate ALL existing active parent connections immediately
+    const socketsToClose = Array.from(allActiveWebSockets);
+    for (const ws of socketsToClose) {
+      if (ws !== clientWs) {
+        console.log("[Proxy] Forcefully terminating duplicate active browser socket to prevent dual voice streams.");
+        try {
+          ws.send(JSON.stringify({
+            type: "close",
+            reason: "Newer microphone session initiated on another frame or thread."
+          }));
+        } catch (e) {
+          console.warn("[Proxy] Handled error sending close to duplicate socket:", e);
+        }
+        try {
+          ws.terminate();
+        } catch (e) {
+          console.warn("[Proxy] Handled error terminating duplicate socket:", e);
+        }
+        allActiveWebSockets.delete(ws);
       }
     }
+    allActiveWebSockets.add(clientWs);
     activeClientSocket = clientWs;
+
+    const sessionsToClose = Array.from(allActiveGeminiSessions);
+    for (const session of sessionsToClose) {
+      console.log("[Proxy] Forcefully closing duplicate active Gemini Live session...");
+      try {
+        session.close();
+      } catch (e) {
+        console.warn("[Proxy] Handled error closing duplicate Gemini session:", e);
+      }
+      allActiveGeminiSessions.delete(session);
+    }
+    activeGeminiSession = null;
     
     const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || "";
     if (!apiKey) {
@@ -701,47 +937,104 @@ async function startServer() {
           console.log("[Proxy] Connecting with model:", message.model);
           const modelName = message.model.startsWith("models/") ? message.model : `models/${message.model}`;
           
+          const attemptId = Math.random().toString(36).substring(2, 11);
+          activeGeminiSessionAttemptId = attemptId;
+
+          if (geminiSession) {
+            console.log("[Proxy] Forcefully closing pre-existing active Gemini session to absolute-prevent dual voices...");
+            try {
+              geminiSession.close();
+            } catch (e) {
+              console.warn("[Proxy] Handled error closing prior active Gemini session:", e);
+            }
+            geminiSession = null;
+          }
+
+          // SERVER-SIDE CONCURRENCY LOCK: Forcefully close any other active sessions in the server-wide registry
+          const registrySessionsToClose = Array.from(allActiveGeminiSessions);
+          for (const s of registrySessionsToClose) {
+            console.log("[Proxy] Connection request: Terminating overlapping active Gemini session in pool...");
+            try {
+              s.close();
+            } catch (e) {
+              console.warn("[Proxy] Handled error closing duplicate pooled Gemini session:", e);
+            }
+            allActiveGeminiSessions.delete(s);
+          }
+          activeGeminiSession = null;
+          
           try {
-            geminiSession = await ai.live.connect({
+            const session = await ai.live.connect({
               model: modelName,
               config: message.config,
               callbacks: {
                 onopen: () => {
                   console.log("[Proxy] Server connected to Gemini Live API");
-                  if (!isClosed) {
-                    clientWs.send(JSON.stringify({ type: "open" }));
+                  if (isClosed || clientWs.readyState !== WebSocket.OPEN || activeClientSocket !== clientWs || activeGeminiSessionAttemptId !== attemptId) {
+                    console.log("[Proxy] Session open callback on a stale/superseded/closed client socket. Collapsing.");
+                    try { session.close(); } catch (e) {}
+                    return;
                   }
+                  clientWs.send(JSON.stringify({ type: "open" }));
                 },
                 onmessage: (msg: any) => {
-                  if (isClosed) return;
+                  if (isClosed || clientWs.readyState !== WebSocket.OPEN || activeClientSocket !== clientWs || activeGeminiSessionAttemptId !== attemptId) {
+                    try { session.close(); } catch (e) {}
+                    return;
+                  }
+                  // Guard against overlapping older/superseded Gemini Live sessions on the same client ws connection
+                  if (activeGeminiSession && session !== activeGeminiSession) {
+                    console.log("[Proxy] Overlaying messages on a stale Gemini session blocked automatically to stop overlapping voices.");
+                    try { session.close(); } catch (e) {}
+                    return;
+                  }
                   // Forward exactly to client
                   clientWs.send(JSON.stringify({ type: "message", data: msg }));
                 },
                 onclose: () => {
                   console.log("[Proxy] Gemini closed voice connection");
+                  if (isClosed || activeClientSocket !== clientWs || activeGeminiSessionAttemptId !== attemptId) return;
+                  if (activeGeminiSession && session !== activeGeminiSession) return;
                   if (!isClosed) {
-                    clientWs.send(JSON.stringify({ type: "close" }));
-                    clientWs.close();
+                    try { clientWs.send(JSON.stringify({ type: "close" })); } catch (e) {}
+                    try { clientWs.close(); } catch (e) {}
                   }
                 },
                 onerror: (err: any) => {
                   console.error("[Proxy] Gemini error:", err);
+                  if (isClosed || activeClientSocket !== clientWs || activeGeminiSessionAttemptId !== attemptId) return;
+                  if (activeGeminiSession && session !== activeGeminiSession) return;
                   if (!isClosed) {
-                    clientWs.send(JSON.stringify({ type: "error", error: err?.message || String(err) }));
+                    try { clientWs.send(JSON.stringify({ type: "error", error: err?.message || String(err) })); } catch (e) {}
                   }
                 }
               }
             });
+
+            // CRITICAL HANDSHAKE CONCURRENCY GUARD: If this client session became stale/superseded/closed 
+            // during the asynchronous connection handshake to Google Gemini, immediately abort and close the new 
+            // Gemini session to guarantee we never leak orphan duplicate voice processes!
+            if (isClosed || clientWs.readyState !== WebSocket.OPEN || activeClientSocket !== clientWs || activeGeminiSessionAttemptId !== attemptId) {
+              console.log("[Proxy] Handshake succeeded but client connection was superseded, closed, or overwritten. Immediately collapsing session.");
+              try {
+                session.close();
+              } catch (e) {}
+              return;
+            }
+
+            geminiSession = session;
+            activeGeminiSession = session;
+            allActiveGeminiSessions.add(session);
           } catch (connErr: any) {
             console.error("[Proxy] Failed to connect to Gemini Live:", connErr);
-            if (!isClosed) {
+            if (!isClosed && activeGeminiSessionAttemptId === attemptId) {
               clientWs.send(JSON.stringify({ type: "error", error: connErr?.message || String(connErr) }));
               clientWs.close();
             }
           }
           return;
         }
-
+ 
         // Forward commands from backend proxy directly to active Gemini session
         if (geminiSession && !isClosed) {
           if (message.type === "input") {
@@ -756,11 +1049,13 @@ async function startServer() {
         console.error("[Proxy] Recv error:", err);
       }
     });
-
+ 
     clientWs.on("close", () => {
       console.log("[Proxy] Browser disconnected from gateway");
+      allActiveWebSockets.delete(clientWs);
       if (activeClientSocket === clientWs) {
         activeClientSocket = null;
+        activeGeminiSessionAttemptId = null;
       }
       isClosed = true;
       if (geminiSession) {
@@ -768,6 +1063,10 @@ async function startServer() {
           geminiSession.close();
         } catch (e) {
           // Graceful collapse
+        }
+        allActiveGeminiSessions.delete(geminiSession);
+        if (activeGeminiSession === geminiSession) {
+          activeGeminiSession = null;
         }
         geminiSession = null;
       }

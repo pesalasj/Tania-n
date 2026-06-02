@@ -27,12 +27,58 @@
         }
       },
       "required": ["userId", "createdAt", "transcript"]
+    },
+    "Reminder": {
+      "title": "Reminder",
+      "description": "A persistent monitoring tracker condition added by the user or Tania.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The unique ID of the user who owns this reminder."
+        },
+        "id": {
+          "type": "string",
+          "description": "The unique reminder ID."
+        },
+        "condition": {
+          "type": "string",
+          "description": "The criteria or condition being monitored."
+        },
+        "targetQuery": {
+          "type": "string",
+          "description": "The optional query details."
+        },
+        "actionPlan": {
+          "type": "string",
+          "description": "The fallback plan of action."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["availability", "buy_sell", "contact_status", "other"],
+          "description": "The category of the tracking reminder."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "met"],
+          "description": "Whether the condition tracking is active or met."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp."
+        }
+      },
+      "required": ["userId", "id", "condition", "status", "createdAt"]
     }
   },
   "firestore": {
     "/conversations/{conversationId}": {
       "schema": "Conversation",
       "description": "Collection of saved conversations."
+    },
+    "/reminders/{reminderId}": {
+      "schema": "Reminder",
+      "description": "Collection of tracked reminders."
     }
   }
 }

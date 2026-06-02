@@ -12,6 +12,31 @@ export interface LiveAPIConfig {
   tools?: any[];
 }
 
+const tabSessionId = typeof window !== 'undefined' ? Math.random().toString(36).substring(2, 11) : '';
+
+const safeLocalStorage = {
+  getItem(key: string): string | null {
+    try {
+      const localVal = localStorage.getItem(key);
+      if (localVal !== null) return localVal;
+      return typeof window !== 'undefined' ? (window as any)[`__win_storage_${key}`] || null : null;
+    } catch (e) {
+      if (typeof window !== 'undefined') {
+        return (window as any)[`__win_storage_${key}`] || null;
+      }
+      return null;
+    }
+  },
+  setItem(key: string, value: string): void {
+    try {
+      if (typeof window !== 'undefined') {
+        (window as any)[`__win_storage_${key}`] = value;
+      }
+      localStorage.setItem(key, value);
+    } catch (e) {}
+  }
+};
+
 export class LiveAPI {
   private ws: WebSocket | null = null;
   private audioContext: AudioContext | null = null;
@@ -26,12 +51,19 @@ export class LiveAPI {
   private isPlaying = false;
   private isUserSpeaking = false;
   private nextStreamTime = 0;
+  private lastTaniaSpeechTime = 0;
+  private silentFramesCount = 0;
+  private isAudioActive = false;
+  private sentSilenceFramesAfterSpeechCount = 0;
+  private inputAudioAccumulator: number[] = [];
   private playingSources: AudioBufferSourceNode[] = [];
   private analyser: AnalyserNode | null = null;
   private volumeInterval: any = null;
   private pingInterval: any = null;
+  private concurrencyInterval: any = null;
   private isDisposed = false;
   public outputDeviceId = "default";
+  private instanceId = Math.random().toString(36).substring(2, 11);
 
   constructor(private config: LiveAPIConfig) {
     console.log("Initialized LiveAPI Browser Proxy Interface Client");
@@ -97,6 +129,37 @@ export class LiveAPI {
       return;
     }
 
+    // Capture exclusive active ownership for this specific LiveAPI instance to absolute-prevent duplication in the same or separate tabs
+    safeLocalStorage.setItem("__active_tania_session_tab_id", tabSessionId);
+    safeLocalStorage.setItem("__active_tania_live_api_instance_id", this.instanceId);
+    if (this.concurrencyInterval) {
+      clearInterval(this.concurrencyInterval);
+    }
+    this.concurrencyInterval = setInterval(() => {
+      try {
+        const activeId = safeLocalStorage.getItem("__active_tania_session_tab_id");
+        const activeInstanceId = safeLocalStorage.getItem("__active_tania_live_api_instance_id");
+        const globalActiveInstance = typeof window !== 'undefined' ? (window as any).__activeLiveApi : null;
+        
+        let shouldDisconnect = false;
+        if (activeId && activeId !== tabSessionId) {
+          shouldDisconnect = true;
+          console.warn("[Concurrency Control] Stale browser tab context detected. Forcing clean disconnect...");
+        } else if (activeInstanceId && activeInstanceId !== this.instanceId) {
+          shouldDisconnect = true;
+          console.warn("[Concurrency Control] New LiveAPI instance has overridden active role in this tab. Forcing clean disconnect to prevent dual voices...");
+        } else if (globalActiveInstance && globalActiveInstance !== this) {
+          shouldDisconnect = true;
+          console.warn("[Concurrency Control] Stale memory instance overridden in window scope. Forcing clean disconnect...");
+        }
+
+        if (shouldDisconnect) {
+          this.disconnect();
+          onClose();
+        }
+      } catch (err) {}
+    }, 400);
+
     try {
       console.log("Connecting client to server WebSocket proxy...");
       this.onTranscript("System: Negotiating connection with voice engine backend...");
@@ -140,6 +203,22 @@ export class LiveAPI {
       this.ws.onmessage = async (event) => {
         if (this.isDisposed) return;
         try {
+          // Robust client-side concurrency safety: verify this instance is still active
+          const activeId = safeLocalStorage.getItem("__active_tania_session_tab_id");
+          const activeInstanceId = safeLocalStorage.getItem("__active_tania_live_api_instance_id");
+          const globalActiveInstance = typeof window !== 'undefined' ? (window as any).__activeLiveApi : null;
+          
+          if (
+            (activeId && activeId !== tabSessionId) ||
+            (activeInstanceId && activeInstanceId !== this.instanceId) ||
+            (globalActiveInstance && globalActiveInstance !== this)
+          ) {
+            console.warn("[Concurrency Control] Stale/superseded LiveAPI instance detected on legacy message packet. Hot-collapsing and muting immediately!");
+            this.disconnect();
+            onClose();
+            return;
+          }
+
           const message = JSON.parse(event.data);
           
           if (message.type === "open") {
@@ -288,6 +367,7 @@ export class LiveAPI {
       return;
     }
     console.log("Setting up audio system...");
+    this.inputAudioAccumulator = [];
     
     // Setup Microphone
     try {
@@ -320,12 +400,17 @@ export class LiveAPI {
         } catch (err: any) {
           if (this.isDisposed) return;
           console.warn("Microphone with full constraints failed, retrying with basic audio:true...", err);
-          this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          try {
+            this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          } catch (basicErr: any) {
+            console.warn("Microphone capture unavailable or not attached:", basicErr);
+            this.onTranscript("System: Microphone not detected or permission denied. You can still stream Tania's voice responses and type to chat!");
+          }
         }
       }
     } catch (err: any) {
       if (this.isDisposed) return;
-      console.error("Microphone Access Error:", err);
+      console.warn("Microphone Access Setup Warning:", err);
       this.onTranscript("System: Microphone not found or access denied. You can still type to chat.");
     }
 
@@ -383,7 +468,7 @@ export class LiveAPI {
     // Recording processor
     if (this.stream) {
       const source = this.audioContext!.createMediaStreamSource(this.stream);
-      this.processor = this.audioContext!.createScriptProcessor(4096, 1, 1);
+      this.processor = this.audioContext!.createScriptProcessor(2048, 1, 1);
       
       this.processor.onaudioprocess = (e) => {
         if (!this.isConnected || !this.ws) return;
@@ -394,29 +479,94 @@ export class LiveAPI {
           
           const downsampledData = this.downsampleBuffer(inputData, currentSampleRate, 16000);
           
-          let maxVal = 0;
+          // Accumulate downsampled samples into stable 100ms blocks (1600 samples at 16000Hz).
+          // This keeps packet frequency constant and low (10 packets/second), completely avoiding network queuing and reducing latency to sub-second real-time speeds!
           for (let i = 0; i < downsampledData.length; i++) {
-            const abs = Math.abs(downsampledData[i]);
-            if (abs > maxVal) maxVal = abs;
+            this.inputAudioAccumulator.push(downsampledData[i]);
           }
-          this.isUserSpeaking = maxVal > 0.001;
 
-          const pcmData = this.float32ToInt16(downsampledData);
-          const base64Data = this.arrayBufferToBase64(pcmData.buffer);
-          
-          this.ws.send(JSON.stringify({
-            type: "input",
-            data: {
-              audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
+          const CHUNK_SIZE = 1600; // 100ms of audio at 16k
+          while (this.inputAudioAccumulator.length >= CHUNK_SIZE) {
+            const chunk = new Float32Array(this.inputAudioAccumulator.slice(0, CHUNK_SIZE));
+            this.inputAudioAccumulator = this.inputAudioAccumulator.slice(CHUNK_SIZE);
+
+            let maxVal = 0;
+            for (let i = 0; i < chunk.length; i++) {
+              const abs = Math.abs(chunk[i]);
+              if (abs > maxVal) maxVal = abs;
             }
-          }));
+
+            // Determine if Tania is currently speaking or just finished speaking (within a robust cushion to defeat acoustic echo completely).
+            // When Tania is speaking, has recently spoken, or has scheduled audio in the Web Audio context queue,
+            // we mute transmission to completely eliminate loudspeaker echo feedback loops and resolve dual voice issues!
+            const isTaniaPlaying = (this.playingSources.length > 0) ||
+                                   (!!this.audioContext && this.audioContext.currentTime < this.nextStreamTime) ||
+                                   (Date.now() - this.lastTaniaSpeechTime < 1500);
+
+            // Dynamic Echo Cancellation and Ambient Noise Gate setup
+            // When Tania is playing, we enforce an exceptionally high threshold to ignore feedback bleeding.
+            const threshold = isTaniaPlaying ? 0.95 : 0.015;
+
+            if (isTaniaPlaying) {
+              // Strictly mute and clear any user voice activity during playback
+              this.isAudioActive = false;
+              this.silentFramesCount = 0;
+              this.sentSilenceFramesAfterSpeechCount = 0;
+            } else {
+              if (maxVal > threshold) {
+                this.isAudioActive = true;
+                this.silentFramesCount = 0;
+              } else {
+                this.silentFramesCount++;
+                // With 100ms frames, 3 silent frames is exactly 300ms of quiet before closing the microphone speaking gate.
+                if (this.silentFramesCount >= 3) {
+                  this.isAudioActive = false;
+                }
+              }
+            }
+
+            // Speaking status depends on physical voice activity
+            this.isUserSpeaking = this.isAudioActive;
+
+            // Determine if we should send this block.
+            // Only send active speech blocks or up to 3 padding silence blocks after active speech blocks to prevent word clipping.
+            let shouldSend = false;
+            let dataToSend = chunk;
+
+            if (this.isAudioActive && !isTaniaPlaying) {
+              shouldSend = true;
+              this.sentSilenceFramesAfterSpeechCount = 3; // Reset hangover frames tickets
+            } else {
+              if (this.sentSilenceFramesAfterSpeechCount > 0 && !isTaniaPlaying) {
+                shouldSend = true;
+                dataToSend = new Float32Array(CHUNK_SIZE); // Send pristine digital silence for trailing frame
+                this.sentSilenceFramesAfterSpeechCount--;
+              }
+            }
+
+            if (shouldSend) {
+              const pcmData = this.float32ToInt16(dataToSend);
+              const base64Data = this.arrayBufferToBase64(pcmData.buffer);
+
+              this.ws.send(JSON.stringify({
+                type: "input",
+                data: {
+                  audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
+                }
+              }));
+            }
+          }
         } catch (err) {
           console.error("Error sending audio input:", err);
         }
       };
 
       source.connect(this.processor);
-      this.processor.connect(this.audioContext!.destination);
+      // Route microphone capture through a silent gain node to force ScriptProcessorNode activity without bleeding feedback to speakers!
+      const silenceGain = this.audioContext!.createGain();
+      silenceGain.gain.value = 0;
+      this.processor.connect(silenceGain);
+      silenceGain.connect(this.audioContext!.destination);
     }
 
     this.startVolumeTracking();
@@ -443,68 +593,111 @@ export class LiveAPI {
 
   private handleAudioOutput(base64: string) {
     if (this.isDisposed || !this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    
+    // Concurrency guard: verify we are still the active window session & instance
+    const activeId = safeLocalStorage.getItem("__active_tania_session_tab_id");
+    const activeInstanceId = safeLocalStorage.getItem("__active_tania_live_api_instance_id");
+    if ((activeId && activeId !== tabSessionId) || (activeInstanceId && activeInstanceId !== this.instanceId)) {
+      console.warn("[Audio Control] Newer/different LiveAPI instance detected during audio playback. Auto-disconnecting and muting voice to prevent overlapping audio.");
+      this.disconnect();
+      return;
+    }
+
     const audioData = this.base64ToFloat32(base64);
     
     if (!this.audioContext || !this.analyser) return;
+
+    // Resiliency: ensure the audio context is active and not suspended by browser idle policies
+    if (this.audioContext.state === "suspended") {
+      this.audioContext.resume().catch((err) => console.error("[Audio] Auto-resuming suspended Context failed:", err));
+    }
+
+    // Mutex stop: immediately query the global array for other instances' active buffer sources and clean them up
+    if ((window as any).__allTaniaAudioSources) {
+      (window as any).__allTaniaAudioSources = (window as any).__allTaniaAudioSources.filter((s: any) => {
+        if (s._instanceId && s._instanceId !== this.instanceId) {
+          try {
+            s.stop();
+          } catch (e) {}
+          return false;
+        }
+        return true;
+      });
+    } else {
+      (window as any).__allTaniaAudioSources = [];
+    }
 
     const buffer = this.audioContext.createBuffer(1, audioData.length, 24000);
     buffer.getChannelData(0).set(audioData);
 
     const source = this.audioContext.createBufferSource();
     source.buffer = buffer;
+    (source as any)._instanceId = this.instanceId;
+    (window as any).__allTaniaAudioSources.push(source);
 
-    // Create a local GainNode per audio chunk to execute sub-millisecond edge fading/crossfading
-    // This removes high-frequency click bursts at slice/packet boundaries
-    const chunkGain = this.audioContext.createGain();
-    
-    // Connect track source -> gain -> primary frequency analyser
-    source.connect(chunkGain);
-    chunkGain.connect(this.analyser);
+    // Connect audio source directly to frequency analyser & speakers for peak fidelity, maximum clarity, and zero cracking!
+    source.connect(this.analyser);
 
     const currentTime = this.audioContext.currentTime;
     const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
     
-    // Maintain a safe/protective lookahead cushion to smooth over brief network arrival delays and avoid word-to-word choppiness
-    const schedulingOffset = isMobile ? 0.12 : 0.05;
+    // Professional tight audio buffering configuration: snappier response, smoother transitions, zero latency breaks!
+    const initialCushion = isMobile ? 0.16 : 0.06;
+    const minCushion = isMobile ? 0.035 : 0.012; // Extremely fast stream recovery window
 
-    // Dynamic latency adjustment:
-    if (this.nextStreamTime < currentTime) {
-      // Underflow: The queue finished or is empty, start fresh from the lookahead offset
-      this.nextStreamTime = currentTime + schedulingOffset;
-    } else if (this.nextStreamTime > currentTime + 3.0) {
-      // Extreme overflow/drift: Clear all active scheduled sources to prevent overlapping/dual voices
-      console.warn(`[Audio] Overflow/drift threshold exceeded (${(this.nextStreamTime - currentTime).toFixed(2)}s). Resetting audio scheduler.`);
-      this.playingSources.forEach(s => {
-        try {
-          s.stop();
-        } catch (e) {}
-      });
-      this.playingSources = [];
-      this.nextStreamTime = currentTime + schedulingOffset;
+    let playTime = this.nextStreamTime;
+
+    // Self-healing playhead timeline scheduler:
+    // To prevent Web Audio API from cutting off or crackling, the playTime must be strictly in the future.
+    // If the playTime falls below current time + minCushion, we absorb the jitter dynamically.
+    if (playTime < currentTime + minCushion) {
+      const gap = currentTime - playTime;
+      // If it is minor timing delay, bridge the gaps with a safe future cushion to heal the stream instantly.
+      if (playTime > 0 && gap <= 0.45) {
+        playTime = currentTime + minCushion;
+      } else {
+        // Fresh start or major network delay: schedule with a robust start cushion
+        playTime = currentTime + initialCushion;
+      }
+    } else if (playTime > currentTime + 15.0) {
+      // Protection against custom buffer accumulation / extreme delay drift: resync queue timeline with a clean cut to prevent dual voices
+      console.warn(`[Audio] Extreme queue delay drift/accumulation detected (${(playTime - currentTime).toFixed(2)}s). Resuming with stable cushion after a clean playback stop.`);
+      this.stopPlayback();
+      playTime = currentTime + initialCushion;
     }
 
     const duration = buffer.duration;
-    const playTime = this.nextStreamTime;
 
-    // Apply 3ms input-and-output micro-fades to blend discontinuous PCM slices with perfect warmth
-    const fadeDuration = Math.min(0.003, duration / 2.1);
-    
-    chunkGain.gain.setValueAtTime(0, playTime);
-    chunkGain.gain.linearRampToValueAtTime(1, playTime + fadeDuration);
-    chunkGain.gain.setValueAtTime(1, playTime + duration - fadeDuration);
-    chunkGain.gain.linearRampToValueAtTime(0, playTime + duration);
-
+    // Schedule the source to start playing precisely at playTime (playTime is guaranteed > currentTime + minCushion)
     source.start(playTime);
     
+    // Track active source to know if Tania is playing
     this.playingSources.push(source);
+    this.lastTaniaSpeechTime = Date.now();
+    
     source.onended = () => {
       this.playingSources = this.playingSources.filter(s => s !== source);
+      if ((window as any).__allTaniaAudioSources) {
+        (window as any).__allTaniaAudioSources = (window as any).__allTaniaAudioSources.filter((s: any) => s !== source);
+      }
     };
 
-    this.nextStreamTime += duration;
+    // Update nextStreamTime to point to the virtual end of this buffer
+    this.nextStreamTime = playTime + duration;
   }
 
   private stopPlayback() {
+    if ((window as any).__allTaniaAudioSources) {
+      (window as any).__allTaniaAudioSources = (window as any).__allTaniaAudioSources.filter((s: any) => {
+        if (s._instanceId === this.instanceId) {
+          try {
+            s.stop();
+          } catch (e) {}
+          return false;
+        }
+        return true;
+      });
+    }
     this.playingSources.forEach(source => {
       try {
         source.stop();
@@ -553,14 +746,18 @@ export class LiveAPI {
 
   private base64ToFloat32(base64: string): Float32Array {
     const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    const int16 = new Int16Array(bytes.buffer);
-    const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) {
-      float32[i] = int16[i] / 32768.0;
+    const len = binary.length;
+    const numSamples = Math.floor(len / 2);
+    const float32 = new Float32Array(numSamples);
+    
+    for (let i = 0; i < numSamples; i++) {
+      const low = binary.charCodeAt(i * 2);
+      const high = binary.charCodeAt(i * 2 + 1);
+      let val = low | (high << 8);
+      if (val & 0x8000) {
+        val |= ~0xffff;
+      }
+      float32[i] = val / 32768.0;
     }
     return float32;
   }
@@ -582,7 +779,14 @@ export class LiveAPI {
 
   disconnect() {
     this.isDisposed = true;
-    if (!this.isConnected && !this.ws && !this.audioContext) return;
+
+    // Immediately stop any actively scheduled Audio Buffer Sources in the browser to prevent overlapping audio
+    this.stopPlayback();
+
+    if (this.concurrencyInterval) {
+      clearInterval(this.concurrencyInterval);
+      this.concurrencyInterval = null;
+    }
 
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
@@ -592,6 +796,7 @@ export class LiveAPI {
     this.isConnected = false;
     this.isPlaying = false;
     this.audioQueue = [];
+    this.inputAudioAccumulator = [];
 
     if (this.ws) {
       try {
@@ -602,11 +807,15 @@ export class LiveAPI {
       this.ws = null;
     }
     if (this.stream) {
-      this.stream.getTracks().forEach(track => track.stop());
+      try {
+        this.stream.getTracks().forEach(track => track.stop());
+      } catch (e) {}
       this.stream = null;
     }
     if (this.processor) {
-      this.processor.disconnect();
+      try {
+        this.processor.disconnect();
+      } catch (e) {}
       this.processor = null;
     }
     if (this.volumeInterval) {
@@ -614,18 +823,32 @@ export class LiveAPI {
       this.volumeInterval = null;
     }
     if (this.analyser) {
-      this.analyser.disconnect();
+      try {
+        this.analyser.disconnect();
+      } catch (e) {}
       this.analyser = null;
     }
     if (this.audioContext) {
-      if (this.audioContext.state !== 'closed') {
-        this.audioContext.close().catch(e => console.error("Error closing AudioContext:", e));
-      }
+      try {
+        if (this.audioContext.state !== 'closed') {
+          this.audioContext.close().catch(e => console.error("Error closing AudioContext:", e));
+        }
+      } catch (e) {}
       this.audioContext = null;
     }
   }
 
   static disconnectAll() {
+    console.log("[Global Cleanup] Cleaning and stopping all global Tania audio playing sources...");
+    if ((window as any).__allTaniaAudioSources) {
+      (window as any).__allTaniaAudioSources.forEach((s: any) => {
+        try {
+          s.stop();
+        } catch (e) {}
+      });
+      (window as any).__allTaniaAudioSources = [];
+    }
+
     const apis = (window as any).__allLiveApis || [];
     console.log(`[Global Cleanup] Disconnecting all ${apis.length} registered LiveAPI instances...`);
     apis.forEach((api: any) => {
